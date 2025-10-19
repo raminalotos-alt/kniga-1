@@ -2,11 +2,6 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { createRequire } from "module";
-
-// pdf-parse — CommonJS, подключаем через createRequire
-const require = createRequire(import.meta.url);
-const pdfParse = require("pdf-parse");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,22 +18,21 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- загрузка и разбиение PDF ----------
-const PDF_PATH = path.join(__dirname, "data", "book.pdf");
+const DATA_DIR = path.join(__dirname, "data");
+const BOOK_TXT = path.join(DATA_DIR, "book.txt");
 
-// Делим текст на главы по ключ. словам или по размеру блоков
-function splitIntoChapters(fullText) {
+// Разбивка на главы по заголовкам; если не нашли — рубим по ~7000 символов
+function splitTextToChapters(fullText) {
   const lines = fullText.replace(/\r/g, "").split("\n");
   const blocks = [];
   let buf = [];
-
-  const isChapterHeader = (s) =>
+  const isHeader = (s) =>
     /^(глава|chapter)\b[\s\d.,\-:]*$/i.test(s.trim()) ||
     /^глава\s+\d+/i.test(s) ||
     /^chapter\s+\d+/i.test(s);
 
   for (const line of lines) {
-    if (isChapterHeader(line) && buf.length > 80) { // новая глава, если буфер уже есть
+    if (isHeader(line) && buf.length > 80) {
       blocks.push(buf.join("\n").trim());
       buf = [line];
     } else {
@@ -47,10 +41,9 @@ function splitIntoChapters(fullText) {
   }
   if (buf.length) blocks.push(buf.join("\n").trim());
 
-  // если “глав” не нашлось — режем каждые ~5000 символов
   if (blocks.length <= 1) {
     const text = lines.join("\n");
-    const size = 5000;
+    const size = 7000;
     const parts = [];
     for (let i = 0; i < text.length; i += size) {
       parts.push(text.slice(i, i + size));
@@ -65,24 +58,35 @@ function splitIntoChapters(fullText) {
   });
 }
 
-let CHAPTERS = [];
-let META = { pages: 0, textLength: 0 };
+// Загружаем главы: если в data много .md/.txt — берём их по очереди; иначе читаем data/book.txt и режем
+function loadChapters() {
+  if (!fs.existsSync(DATA_DIR)) return [];
+  const files = fs.readdirSync(DATA_DIR).filter(f => /\.(md|txt)$/i.test(f)).sort();
 
-async function loadPdf() {
-  const data = fs.readFileSync(PDF_PATH);
-  const result = await pdfParse(data); // { text, numpages, info, ... }
-  META.pages = result.numpages || 0;
-  META.textLength = result.text.length;
-  CHAPTERS = splitIntoChapters(result.text);
-  console.log(`PDF loaded: pages=${META.pages}, chapters=${CHAPTERS.length}`);
+  if (files.length > 1) {
+    return files.map((fname, i) => {
+      const text = fs.readFileSync(path.join(DATA_DIR, fname), "utf8");
+      const first = (text.split("\n").find(s => s.trim().length > 0) || "").trim();
+      const title = first.replace(/^#\s*/, "").slice(0, 120) || `Часть ${i + 1}`;
+      return { id: i + 1, filename: fname, title, text };
+    });
+  }
+
+  if (fs.existsSync(BOOK_TXT)) {
+    const text = fs.readFileSync(BOOK_TXT, "utf8");
+    const parts = splitTextToChapters(text);
+    return parts;
+  }
+
+  return [];
 }
-await loadPdf();
 
-// ---------- эндпоинты ----------
-app.get("/health", (req, res) => res.json({ status: "ok", pages: META.pages, chapters: CHAPTERS.length }));
+let CHAPTERS = loadChapters();
+
+app.get("/health", (req, res) => res.json({ status: "ok", chapters: CHAPTERS.length }));
 
 app.get("/toc", (req, res) => {
-  res.json({ toc: CHAPTERS.map(c => ({ id: c.id, title: c.title })) });
+  res.json({ toc: CHAPTERS.map(({ id, title }) => ({ id, title })) });
 });
 
 app.get("/chapter", (req, res) => {
@@ -96,14 +100,14 @@ app.post("/search", (req, res) => {
   const q = String(req.body?.query || "").trim();
   const limit = Math.max(1, Math.min(50, Number(req.body?.limit ?? 10)));
   if (!q) return res.status(400).json({ error: "bad_request", detail: "field 'query' is required" });
-  const needle = q.toLowerCase();
 
+  const needle = q.toLowerCase();
   const hits = [];
   for (const ch of CHAPTERS) {
-    const where = ch.text.toLowerCase().indexOf(needle);
-    if (where >= 0) {
-      const start = Math.max(0, where - 160);
-      const end = Math.min(ch.text.length, where + q.length + 160);
+    const idx = ch.text.toLowerCase().indexOf(needle);
+    if (idx >= 0) {
+      const start = Math.max(0, idx - 160);
+      const end = Math.min(ch.text.length, idx + q.length + 160);
       const excerpt = ch.text.slice(start, end).replace(/\s+/g, " ").trim();
       hits.push({ chapterId: ch.id, title: ch.title, excerpt });
       if (hits.length >= limit) break;
@@ -112,15 +116,11 @@ app.post("/search", (req, res) => {
   res.json({ result: hits });
 });
 
-// Перечитать PDF без деплоя (если заменишь файл)
-app.post("/reload", async (req, res) => {
-  try {
-    await loadPdf();
-    res.json({ reloaded: true, chapters: CHAPTERS.length });
-  } catch (e) {
-    res.status(500).json({ error: "reload_failed", detail: String(e) });
-  }
+app.post("/reload", (req, res) => {
+  CHAPTERS = loadChapters();
+  res.json({ reloaded: true, chapters: CHAPTERS.length });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Running on ${PORT} (chapters=${CHAPTERS.length})`));
+app.listen(PORT, () => console.log(`Running on ${PORT}, chapters: ${CHAPTERS.length}`));
+
